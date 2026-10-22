@@ -1,0 +1,250 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e438073..b95db80 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3782,6 +3782,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // amax rescale chain from build_amax_src1_f16: ABS, POOL_1D, SCALE, LOG, SCALE, CEIL, CLAMP, SCALE, EXP, DIV
++    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ABS && i + 9 < cgraph->n_nodes) {
++        static const enum ggml_op amax_ops[10] = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
++                                                   GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_DIV };
++        const int amax_outs[2] = { i + 8, i + 9 };
++        ggml_tensor ** n = cgraph->nodes + i;
++        const ggml_tensor * x = node->src[0];
++        bool ok = ggml_can_fuse_subgraph(cgraph, i, 10, amax_ops, amax_outs, 2);
++        for (int k = 1; ok && k < 9; ++k) {
++            ok = n[k]->src[0] == n[k - 1] && n[k]->type == GGML_TYPE_F32 && ggml_is_contiguous(n[k]);
++        }
++        if (ok) {
++            const int32_t * pp = (const int32_t *) n[1]->op_params;
++            ok = ggml_get_unary_op(n[5]) == GGML_UNARY_OP_CEIL && ggml_get_unary_op(n[8]) == GGML_UNARY_OP_EXP &&
++                 n[9]->src[0] == x && n[9]->src[1] == n[8] &&
++                 x->type == GGML_TYPE_F32 && n[0]->type == GGML_TYPE_F32 && n[9]->type == GGML_TYPE_F32 &&
++                 ggml_is_contiguous(x) && ggml_is_contiguous(n[0]) && ggml_is_contiguous(n[9]) && ggml_are_same_shape(x, n[9]) &&
++                 pp[0] == GGML_OP_POOL_MAX && pp[1] == x->ne[0] && pp[2] == x->ne[0] && pp[3] == 0 &&
++                 n[1]->ne[0] == 1 && ggml_nelements(n[8]) == ggml_nrows(x);
++        }
++        if (ok) {
++            // the kernel reads a whole row before writing it, so y may alias x exactly; e must not overlap either
++            const char * xb = (const char *) x->data;     const char * xe = xb + ggml_nbytes(x);
++            const char * yb = (const char *) n[9]->data;  const char * ye = yb + ggml_nbytes(n[9]);
++            const char * eb = (const char *) n[8]->data;  const char * ee = eb + ggml_nbytes(n[8]);
++            const bool y_ok = yb == xb || ye <= xb || yb >= xe;
++            const bool e_ok = (ee <= xb || eb >= xe) && (ee <= yb || eb >= ye);
++            ok = y_ok && e_ok;
++        }
++        if (ok) {
++            ggml_cuda_op_amax_rescale(*cuda_ctx, n);
++            return 9;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+@@ -4575,6 +4610,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
++    ggml_cuda_mmvq_cache_invalidate(cuda_ctx->device);
++
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 930f1ad..44abdf9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1452,6 +1452,12 @@ static void mul_mat_vec_q_switch_type(
+     }
+ }
+ 
++mmvq_q8_cache mmvq_q8_caches[GGML_CUDA_MAX_DEVICES];
++
++void ggml_cuda_mmvq_cache_invalidate(int device) {
++    mmvq_q8_caches[device].valid = false;
++}
++
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -1549,13 +1555,45 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t  q8_size     = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++
++    // Reuse the q8_1 activations when consecutive MMVQ calls quantize the same src1 tensor (e.g. Q/K/V projections).
++    mmvq_q8_cache & qc = mmvq_q8_caches[ctx.device];
++    bool use_cache = false;
++    if (ctx.curr_stream_no == 0 && q8_size <= MMVQ_Q8_CACHE_SIZE) {
++        if (qc.buf == nullptr) {
++            cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++            CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
++            if (st == cudaStreamCaptureStatusNone) {
++                CUDA_CHECK(cudaMalloc(&qc.buf, MMVQ_Q8_CACHE_SIZE));
++            }
++        }
++        use_cache = qc.buf != nullptr;
++    }
++    const bool cache_hit = use_cache && qc.valid && qc.src1 == src1 && qc.data == src1->data &&
++        memcmp(qc.ne, src1->ne, sizeof(qc.ne)) == 0 && memcmp(qc.nb, src1->nb, sizeof(qc.nb)) == 0;
++
++    ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
++    char * src1_q8_1_ptr;
++    if (use_cache) {
++        src1_q8_1_ptr = (char *) qc.buf;
++    } else {
++        src1_q8_1_ptr = src1_q8_1_alloc.alloc(q8_size);
++    }
++    if (!cache_hit) {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (use_cache) {
++            qc.valid = true;
++            qc.src1  = src1;
++            qc.data  = src1->data;
++            memcpy(qc.ne, src1->ne, sizeof(qc.ne));
++            memcpy(qc.nb, src1->nb, sizeof(qc.nb));
++        }
+     }
++    struct { char * get() const { return p; } char * p; } src1_q8_1 = { src1_q8_1_ptr };
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+     const int64_t s11 = ne10_padded / QK8_1;
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 5605bf7..b545e09 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -16,3 +16,18 @@ void ggml_cuda_op_mul_mat_vec_q(
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+     const int64_t src1_padded_row_size, cudaStream_t stream);
++
++#define MMVQ_Q8_CACHE_SIZE (4u << 20)
++
++struct mmvq_q8_cache {
++    void              * buf   = nullptr;
++    bool                valid = false;
++    const ggml_tensor * src1  = nullptr;
++    const void        * data  = nullptr;
++    int64_t             ne[GGML_MAX_DIMS] = {};
++    size_t              nb[GGML_MAX_DIMS] = {};
++};
++
++extern mmvq_q8_cache mmvq_q8_caches[GGML_CUDA_MAX_DEVICES];
++
++void ggml_cuda_mmvq_cache_invalidate(int device);
+diff --git a/ggml/src/ggml-cuda/pool1d.cu b/ggml/src/ggml-cuda/pool1d.cu
+index ac6fb0c..391fb0d 100644
+--- a/ggml/src/ggml-cuda/pool1d.cu
++++ b/ggml/src/ggml-cuda/pool1d.cu
+@@ -49,6 +49,29 @@ static __global__ void pool1d_nchw_kernel(
+     o_ptr[cur_ow] = res;
+ }
+ 
++// one warp per row: pooling window covers the whole row (OW == 1, no padding)
++static __global__ void pool1d_row_kernel(const int iw, const int nr, const float * src, float * dst, const enum ggml_op_pool op) {
++    const int row = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
++    if (row >= nr) {
++        return;
++    }
++    const int lane = threadIdx.x % WARP_SIZE;
++    const float * i_ptr = src + (int64_t) row * iw;
++    float res = op == GGML_OP_POOL_MAX ? -FLT_MAX : 0.0f;
++    for (int i = lane; i < iw; i += WARP_SIZE) {
++        const float cur = __ldg(i_ptr + i);
++        res = op == GGML_OP_POOL_MAX ? fmaxf(res, cur) : res + cur;
++    }
++    if (op == GGML_OP_POOL_MAX) {
++        res = warp_reduce_max(res);
++    } else {
++        res = warp_reduce_sum(res) / iw;
++    }
++    if (lane == 0) {
++        dst[row] = res;
++    }
++}
++
+ static void pool1d_nchw_kernel_f32_f32_cuda(
+         const int iw, const int ow,
+         const int kw, const int sw, const int pw,
+@@ -81,5 +104,61 @@ void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     const int parallel_elements = (int)(nr * OW);
+ 
++    if (OW == 1 && p0 == 0 && k0 >= IW && IW > 0 && (op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG)) {
++        const int rows_per_block = 4;
++        const int nb = (int)((nr + rows_per_block - 1) / rows_per_block);
++        pool1d_row_kernel<<<nb, rows_per_block * WARP_SIZE, 0, stream>>>((int) IW, (int) nr, src0_d, dst_d, op);
++        return;
++    }
++
+     pool1d_nchw_kernel_f32_f32_cuda(IW, OW, k0, s0, p0, parallel_elements, src0_d, dst_d, op, stream);
+ }
++
++
++// Fused amax rescale (build_amax_src1_f16): for each row of x
++//   e = exp(s7 * clamp(ceil(s4 * log(s2 * max|x| + b2) + b4), lo, hi) + b7),  y = x / e
++// Same float ops in the same order as the unfused graph, so results are bit-identical.
++static __global__ void amax_rescale_kernel(const float * x, float * e_out, float * y, const int iw, const int nr,
++        const float s2, const float b2, const float s4, const float b4, const float lo, const float hi, const float s7, const float b7) {
++    const int row = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
++    if (row >= nr) {
++        return;
++    }
++    const int lane = threadIdx.x % WARP_SIZE;
++    const float * xr = x + (int64_t) row * iw;
++    float amax = -FLT_MAX;
++    for (int i = lane; i < iw; i += WARP_SIZE) {
++        amax = fmaxf(amax, fabsf(__ldg(xr + i)));
++    }
++    amax = warp_reduce_max(amax);
++    float e = s2 * amax + b2;
++    e = logf(e);
++    e = s4 * e + b4;
++    e = ceilf(e);
++    e = fminf(fmaxf(e, lo), hi);
++    e = s7 * e + b7;
++    e = expf(e);
++    if (lane == 0) {
++        e_out[row] = e;
++    }
++    float * yr = y + (int64_t) row * iw;
++    for (int i = lane; i < iw; i += WARP_SIZE) {
++        yr[i] = xr[i] / e;
++    }
++}
++
++void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, ggml_tensor ** n) {
++    const ggml_tensor * x = n[0]->src[0];
++    ggml_tensor * e_t = n[8];
++    ggml_tensor * y   = n[9];
++    const int iw = (int) x->ne[0];
++    const int nr = (int) ggml_nrows(x);
++    const int rows_per_block = 4;
++    const int nb = (nr + rows_per_block - 1) / rows_per_block;
++    amax_rescale_kernel<<<nb, rows_per_block * WARP_SIZE, 0, ctx.stream()>>>(
++        (const float *) x->data, (float *) e_t->data, (float *) y->data, iw, nr,
++        ggml_get_op_params_f32(n[2], 0), ggml_get_op_params_f32(n[2], 1),
++        ggml_get_op_params_f32(n[4], 0), ggml_get_op_params_f32(n[4], 1),
++        ggml_get_op_params_f32(n[6], 0), ggml_get_op_params_f32(n[6], 1),
++        ggml_get_op_params_f32(n[7], 0), ggml_get_op_params_f32(n[7], 1));
++}
+diff --git a/ggml/src/ggml-cuda/pool1d.cuh b/ggml/src/ggml-cuda/pool1d.cuh
+index c79461d..94842ed 100644
+--- a/ggml/src/ggml-cuda/pool1d.cuh
++++ b/ggml/src/ggml-cuda/pool1d.cuh
+@@ -3,3 +3,5 @@
+ #define CUDA_POOL1D_BLOCK_SIZE 256
+ 
+ void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes);
