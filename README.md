@@ -24,14 +24,16 @@ Single stream, one RTX PRO 6000 Blackwell Server Edition (96 GB, driver 580, CUD
 
 ¹ Prefill gain comes from `-ub 2048` (default 512), measured on the patched build with both settings.
 
-Greedy output of the patched build is byte-identical to stock (`bench/same_output.py`), and `test-backend-ops` passes for `MUL_MAT`, `MUL_MAT_ID` and `POOL_1D`.
+Greedy output of the patched build is byte-identical to stock (`bench/same_output.py`, compare with `--spec-type none` on both: speculation state carried between requests changes batch shapes and therefore rounding). `test-backend-ops` passes for `MUL_MAT`, `MUL_MAT_ID`, `POOL_1D` and the new `AMAX_RESCALE` and `MUL_MAT_SHARED_SRC1`.
+
+The test box shares its GPU with other tenants (time-slicing layer), so single runs occasionally drop to 40–100 tok/s; the numbers above are typical runs, repeat a few times when you measure.
 
 ## What the patch does
 
-`flint-speed.patch` touches only the CUDA backend (5 files, +174 lines). Profiled with Nsight Systems: a decode step was ~2000 tiny kernels, latency-bound (GPU "100% busy" at 200 W, 29% memory bandwidth).
+`flint-speed.patch` changes only the CUDA backend plus two new `test-backend-ops` cases (6 files, +277 lines). The same change as two commits: [pqhaz3925/llama.cpp@cuda-amax-rescale-fusion](https://github.com/pqhaz3925/llama.cpp/tree/cuda-amax-rescale-fusion). Profiled with Nsight Systems: a decode step was ~2000 tiny kernels, latency-bound (GPU "100% busy" at 200 W, 29% memory bandwidth).
 
 1. **amax rescale fusion.** For Flint (and Mistral 4 / Mellum) llama.cpp scales the input of the expert down-projection by a power of two derived from `max|x|` per row (`build_amax_src1_f16`). On CUDA that `max` ran through `pool_1d`, whose kernel gives each output to one thread that loops over the row: 6 threads on the whole GPU, 23 µs per MoE layer, ~20% of decode time. Followed by 8 more one-element kernels (`log`, `ceil`, `clamp`, `exp`, ...). The patch adds a warp-per-row path to `pool_1d` for whole-row windows and fuses the whole `abs → pool → scale → log → scale → ceil → clamp → scale → exp → div` chain into one kernel (same float ops in the same order, so results are bit-identical). The chain's `div` is allocated in place over its input, which the generic fusion overlap check rejects; the kernel reads each row fully before writing it, so exact aliasing is allowed explicitly. **192 → 257 tok/s.**
-2. **Reuse quantized activations in MMVQ.** Every quantized mat-vec re-quantized its input to q8_1, even when consecutive mat-vecs share it (Q/K/V). The patch keeps the last q8_1 activations in a small per-device buffer and skips the quantize kernel when the next MMVQ call has the same `src1` tensor; the cache is invalidated at the start of every graph evaluation and only used on the main stream for decode-sized batches. **257 → 267 tok/s.**
+2. **Reuse quantized activations in MMVQ.** Every quantized mat-vec re-quantized its input to q8_1, even when consecutive mat-vecs share it (Q/K/V). The patch keeps the last q8_1 activations in a small per-context buffer and skips the quantize kernel when the next MMVQ call has the same `src1` tensor; the cache is invalidated at the start of every graph evaluation and only used on the main stream for decode-sized batches. **257 → 267 tok/s.**
 
 Server flags on top (in `serve.sh`): `-b 2048 -ub 2048` (prefill +60–75%), `--spec-type ngram-mod --spec-ngram-mod-n-min 8` (no draft model; big win when the output repeats the context, no cost otherwise).
 

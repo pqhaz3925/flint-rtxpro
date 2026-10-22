@@ -1,8 +1,50 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 049100fe3..d3bd03d83 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1445,6 +1445,18 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// q8_1 activations of the last MMVQ call, reused when the next MMVQ call quantizes the same src1 (e.g. Q/K/V).
++// Valid only within one graph evaluation; invalidated at the start of each one.
++#define GGML_CUDA_MMVQ_Q8_CACHE_SIZE (4u << 20)
++struct ggml_cuda_mmvq_q8_cache {
++    void              * buf   = nullptr;
++    bool                valid = false;
++    const ggml_tensor * src1  = nullptr;
++    const void        * data  = nullptr;
++    int64_t             ne[GGML_MAX_DIMS] = {};
++    size_t              nb[GGML_MAX_DIMS] = {};
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1457,6 +1469,8 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    ggml_cuda_mmvq_q8_cache mmvq_q8_cache;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e438073..b95db80 100644
+index e43807392..6edd812d4 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3782,6 +3782,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -764,6 +764,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (mmvq_q8_cache.buf != nullptr) {
++        CUDA_CHECK(cudaFree(mmvq_q8_cache.buf));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -3782,6 +3785,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -44,33 +86,21 @@ index e438073..b95db80 100644
      if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
              ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
              ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
-@@ -4575,6 +4610,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
- static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
-     bool graph_evaluated_or_captured = false;
+@@ -4603,6 +4641,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     };
  
-+    ggml_cuda_mmvq_cache_invalidate(cuda_ctx->device);
+     while (!graph_evaluated_or_captured) {
++        // cached MMVQ activations never carry over from a previous evaluation
++        cuda_ctx->mmvq_q8_cache.valid = false;
 +
-     // flag used to determine whether it is an integrated_gpu
-     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
- 
+         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
+         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+         if (!use_cuda_graph || cuda_graph_update_required) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 930f1ad..44abdf9 100644
+index 930f1adc4..ee7a31764 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1452,6 +1452,12 @@ static void mul_mat_vec_q_switch_type(
-     }
- }
- 
-+mmvq_q8_cache mmvq_q8_caches[GGML_CUDA_MAX_DEVICES];
-+
-+void ggml_cuda_mmvq_cache_invalidate(int device) {
-+    mmvq_q8_caches[device].valid = false;
-+}
-+
- void ggml_cuda_mul_mat_vec_q(
-         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-         const ggml_cuda_mm_fusion_args_host * fusion) {
-@@ -1549,13 +1555,45 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1549,12 +1549,43 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -79,14 +109,14 @@ index 930f1ad..44abdf9 100644
 +    const size_t  q8_size     = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 +
 +    // Reuse the q8_1 activations when consecutive MMVQ calls quantize the same src1 tensor (e.g. Q/K/V projections).
-+    mmvq_q8_cache & qc = mmvq_q8_caches[ctx.device];
++    ggml_cuda_mmvq_q8_cache & qc = ctx.mmvq_q8_cache;
 +    bool use_cache = false;
-+    if (ctx.curr_stream_no == 0 && q8_size <= MMVQ_Q8_CACHE_SIZE) {
++    if (ctx.curr_stream_no == 0 && q8_size <= GGML_CUDA_MMVQ_Q8_CACHE_SIZE) {
 +        if (qc.buf == nullptr) {
 +            cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
 +            CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
 +            if (st == cudaStreamCaptureStatusNone) {
-+                CUDA_CHECK(cudaMalloc(&qc.buf, MMVQ_Q8_CACHE_SIZE));
++                CUDA_CHECK(cudaMalloc(&qc.buf, GGML_CUDA_MMVQ_Q8_CACHE_SIZE));
 +            }
 +        }
 +        use_cache = qc.buf != nullptr;
@@ -115,35 +145,19 @@ index 930f1ad..44abdf9 100644
 +            memcpy(qc.nb, src1->nb, sizeof(qc.nb));
 +        }
      }
-+    struct { char * get() const { return p; } char * p; } src1_q8_1 = { src1_q8_1_ptr };
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-     const int64_t s11 = ne10_padded / QK8_1;
-diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index 5605bf7..b545e09 100644
---- a/ggml/src/ggml-cuda/mmvq.cuh
-+++ b/ggml/src/ggml-cuda/mmvq.cuh
-@@ -16,3 +16,18 @@ void ggml_cuda_op_mul_mat_vec_q(
-     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-     const int64_t src1_padded_row_size, cudaStream_t stream);
-+
-+#define MMVQ_Q8_CACHE_SIZE (4u << 20)
-+
-+struct mmvq_q8_cache {
-+    void              * buf   = nullptr;
-+    bool                valid = false;
-+    const ggml_tensor * src1  = nullptr;
-+    const void        * data  = nullptr;
-+    int64_t             ne[GGML_MAX_DIMS] = {};
-+    size_t              nb[GGML_MAX_DIMS] = {};
-+};
-+
-+extern mmvq_q8_cache mmvq_q8_caches[GGML_CUDA_MAX_DEVICES];
-+
-+void ggml_cuda_mmvq_cache_invalidate(int device);
+@@ -1580,7 +1611,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 diff --git a/ggml/src/ggml-cuda/pool1d.cu b/ggml/src/ggml-cuda/pool1d.cu
-index ac6fb0c..391fb0d 100644
+index ac6fb0cbd..391fb0d14 100644
 --- a/ggml/src/ggml-cuda/pool1d.cu
 +++ b/ggml/src/ggml-cuda/pool1d.cu
 @@ -49,6 +49,29 @@ static __global__ void pool1d_nchw_kernel(
@@ -239,7 +253,7 @@ index ac6fb0c..391fb0d 100644
 +        ggml_get_op_params_f32(n[7], 0), ggml_get_op_params_f32(n[7], 1));
 +}
 diff --git a/ggml/src/ggml-cuda/pool1d.cuh b/ggml/src/ggml-cuda/pool1d.cuh
-index c79461d..94842ed 100644
+index c79461dd8..94842edd5 100644
 --- a/ggml/src/ggml-cuda/pool1d.cuh
 +++ b/ggml/src/ggml-cuda/pool1d.cuh
 @@ -3,3 +3,5 @@
@@ -248,3 +262,127 @@ index c79461d..94842ed 100644
  void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +
 +void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 9f2d1f54d..44163d932 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3697,6 +3697,103 @@ struct test_softcap : public test_case {
+     }
+ };
+ 
++// amax rescale chain from llm_graph_context::build_amax_src1_f16 (fused into one kernel by CUDA)
++struct test_amax_rescale : public test_case {
++    const std::array<int64_t, 4> ne;
++    const float x_scale;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "AMAX_RESCALE";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR2(ne, x_scale);
++    }
++
++    test_amax_rescale(std::array<int64_t, 4> ne = {512, 6, 1, 1}, float x_scale = 1e5f)
++        : ne(ne), x_scale(x_scale) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++
++        // per-row magnitudes from 0 to x_scale, so the power-of-two exponent varies between rows (incl. the clamp at 0)
++        ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
++        ggml_set_name(r, "r");
++
++        // x is an intermediate result, so the allocator may place the DIV in-place over it, as in the model graph
++        ggml_tensor * x = ggml_mul(ctx, a, ggml_scale(ctx, r, x_scale));
++        ggml_set_name(x, "x");
++
++        ggml_tensor * amax = ggml_pool_1d(ctx, ggml_abs(ctx, x), GGML_OP_POOL_MAX, ne[0], ne[0], 0);
++
++        ggml_tensor * e = ggml_scale(ctx, amax, 1.0f/1024.0f);
++        e = ggml_log  (ctx, e);
++        e = ggml_scale(ctx, e, 1.4426950408889634f);
++        e = ggml_ceil (ctx, e);
++        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
++        e = ggml_scale(ctx, e, 0.6931471805599453f);
++        e = ggml_exp  (ctx, e);
++
++        // both results are used afterwards; adding e keeps a wrong scale visible
++        ggml_tensor * out = ggml_add(ctx, ggml_div(ctx, x, e), e);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
++// several MUL_MATs reading the same activations (e.g. Q/K/V projections), with a MUL_MAT on other activations in between
++struct test_mul_mat_shared_src1 : public test_case {
++    const ggml_type type_a;
++    const int64_t m;
++    const int64_t n;
++    const int64_t k;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "MUL_MAT_SHARED_SRC1";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(type_a, m, n, k);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q4_0, int64_t m = 64, int64_t n = 1, int64_t k = 256)
++        : type_a(type_a), m(m), n(n), k(k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_set_name(b, "b");
++
++        ggml_tensor * x = ggml_scale(ctx, b, 0.5f);
++        ggml_tensor * y = ggml_scale(ctx, b, 2.0f);
++
++        ggml_tensor * w[4];
++        for (int i = 0; i < 4; ++i) {
++            w[i] = ggml_new_tensor_2d(ctx, type_a, k, m);
++            ggml_set_name(w[i], ("w" + std::to_string(i)).c_str());
++        }
++
++        ggml_tensor * out = ggml_mul_mat(ctx, w[0], x);
++        out = ggml_add(ctx, out, ggml_mul_mat(ctx, w[1], x));
++        out = ggml_add(ctx, out, ggml_mul_mat(ctx, w[2], y));
++        out = ggml_add(ctx, out, ggml_mul_mat(ctx, w[3], x));
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
+ // GGML_OP_SILU_BACK
+ struct test_silu_back : public test_case {
+     const ggml_type type;
+@@ -10797,6 +10894,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
+     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {100, 10, 10, 10}, 0.5f, 0.0f));
+     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
++    for (auto ne : std::vector<std::array<int64_t, 4>>{ {512, 6, 1, 1}, {512, 6, 7, 1}, {300, 4, 3, 2}, {2048, 1, 1, 1} }) {
++        test_cases.emplace_back(new test_amax_rescale(ne, 1e5f));
++    }
++    test_cases.emplace_back(new test_amax_rescale({512, 6, 1, 1}, 1.0f));
++    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4 }) {
++        for (int64_t n : { 1, 3, 8 }) {
++            test_cases.emplace_back(new test_mul_mat_shared_src1(type_a, 64, n, 256));
++        }
++    }
+     test_cases.emplace_back(new test_silu_back());
+ 
+     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
